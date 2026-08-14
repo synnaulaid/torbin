@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOR_UID="$(id -u debian-tor)"
+NFT_FILE="/etc/nftables.d/tor-transparent.nft"
+NFT_MAIN="/etc/nftables.conf"
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Jalankan dengan sudo."
+    exit 1
+fi
+
+if ! systemctl is-active --quiet tor@default; then
+    echo "[+] Starting Tor..."
+    systemctl start tor@default
+fi
+
+echo "[+] Checking Tor..."
+
+if ! systemctl is-active --quiet tor@default; then
+    echo "[!] Tor gagal start."
+    systemctl status tor@default --no-pager -l
+    exit 1
+fi
+
+mkdir -p /etc/nftables.d
+
+cat > "$NFT_FILE" <<EOF
+table ip tor_transparent {
+    chain output {
+        type nat hook output priority -90; policy accept;
+
+        # Jangan redirect proses Tor sendiri
+        meta skuid $TOR_UID return
+
+        # Jangan redirect localhost
+        ip daddr 127.0.0.0/8 return
+
+        # Jangan redirect private network
+        ip daddr 10.0.0.0/8 return
+        ip daddr 172.16.0.0/12 return
+        ip daddr 192.168.0.0/16 return
+
+        # TCP -> Tor TransPort
+        tcp dport != 9040 counter redirect to :9040
+
+        # DNS -> Tor DNSPort
+        udp dport 53 counter redirect to :5354
+        tcp dport 53 counter redirect to :5354
+    }
+}
+EOF
+
+# Hapus table milik kita saja jika sebelumnya masih ada
+nft delete table ip tor_transparent 2>/dev/null || true
+
+# Validasi
+nft -c -f "$NFT_FILE"
+
+# Load table
+nft -f "$NFT_FILE"
+
+# Pastikan include ada satu kali saja
+if ! grep -Fq 'include "/etc/nftables.d/tor-transparent.nft"' "$NFT_MAIN" 2>/dev/null; then
+    printf '\n# Tor transparent proxy\ninclude "/etc/nftables.d/tor-transparent.nft"\n' >> "$NFT_MAIN"
+fi
+
+systemctl enable nftables
+systemctl start nftables
+
+echo
+echo "================================"
+echo " TOR TRANSPARENT: ON"
+echo "================================"
+echo "SOCKS5 : 127.0.0.1:9050"
+echo "TCP    : 127.0.0.1:9040"
+echo "DNS    : 127.0.0.1:5354"
+echo
+
+nft list table ip tor_transparent

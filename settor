@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Tor Transparent Proxy Installer
+# Debian / Ubuntu
+#
+# Flow:
+#   Application
+#       -> nftables
+#       -> Tor TransPort :9040
+#       -> Tor
+#       -> Internet
+#
+# DNS:
+#   Application
+#       -> nftables
+#       -> Tor DNSPort :5354
+#
+# SOCKS:
+#   127.0.0.1:9050
+#
+# Control:
+#   /run/tor/control
+# ============================================================
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[!] Jalankan dengan sudo:"
+    echo "    sudo bash $0"
+    exit 1
+fi
+
+REAL_USER="${SUDO_USER:-${USER:-root}}"
+
+if [[ "$REAL_USER" == "root" ]]; then
+    echo "[!] Tidak bisa menentukan user biasa."
+    echo "    Jalankan: sudo bash $0"
+    exit 1
+fi
+
+echo
+echo "=========================================="
+echo " Tor Transparent Proxy Installer"
+echo "=========================================="
+echo "[+] User      : $REAL_USER"
+echo
+
+# ------------------------------------------------------------
+# 1. Install packages
+# ------------------------------------------------------------
+
+echo "[1/10] Installing packages..."
+
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    tor \
+    socat \
+    nftables \
+    xxd \
+    curl
+
+# ------------------------------------------------------------
+# 2. Backup Tor config
+# ------------------------------------------------------------
+
+echo "[2/10] Backing up Tor configuration..."
+
+TORRC="/etc/tor/torrc"
+
+if [[ -f "$TORRC" ]]; then
+    BACKUP="/etc/tor/torrc.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$TORRC" "$BACKUP"
+    echo "[+] Backup: $BACKUP"
+fi
+
+# ------------------------------------------------------------
+# 3. Get debian-tor UID/GID
+# ------------------------------------------------------------
+
+TOR_UID="$(id -u debian-tor)"
+TOR_GID="$(id -g debian-tor)"
+
+echo
+echo "[+] debian-tor UID : $TOR_UID"
+echo "[+] debian-tor GID : $TOR_GID"
+
+# ------------------------------------------------------------
+# 4. Write Tor configuration
+# ------------------------------------------------------------
+
+echo
+echo "[3/10] Writing /etc/tor/torrc..."
+
+cat > "$TORRC" <<EOF
+DataDirectory /var/lib/tor
+PidFile /run/tor/tor.pid
+RunAsDaemon 1
+User debian-tor
+
+ControlSocket /run/tor/control GroupWritable RelaxDirModeCheck
+ControlSocketsGroupWritable 1
+
+SocksPort unix:/run/tor/socks WorldWritable
+SocksPort 127.0.0.1:9050
+
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+CookieAuthFile /run/tor/control.authcookie
+
+Log notice syslog
+
+TransPort 127.0.0.1:9040
+DNSPort 127.0.0.1:5354
+EOF
+
+# ------------------------------------------------------------
+# 5. Verify Tor configuration
+# ------------------------------------------------------------
+
+echo
+echo "[4/10] Verifying Tor configuration..."
+
+tor --verify-config -f "$TORRC"
+
+# ------------------------------------------------------------
+# 6. Add user to debian-tor group
+# ------------------------------------------------------------
+
+echo
+echo "[5/10] Adding $REAL_USER to debian-tor group..."
+
+usermod -aG debian-tor "$REAL_USER"
+
+# ------------------------------------------------------------
+# 7. Restart Tor
+# ------------------------------------------------------------
+
+echo
+echo "[6/10] Starting Tor..."
+
+systemctl enable tor@default
+systemctl restart tor@default
+
+sleep 3
+
+if ! systemctl is-active --quiet tor@default; then
+    echo
+    echo "[!] Tor gagal berjalan."
+    systemctl status tor@default --no-pager -l
+    exit 1
+fi
+
+echo "[+] Tor is running."
+
+# ------------------------------------------------------------
+# 8. Check listeners
+# ------------------------------------------------------------
+
+echo
+echo "[7/10] Checking Tor listeners..."
+
+ss -lntup | grep -E '127\.0\.0\.1:(9040|9050)|127\.0\.0\.1:5354' || {
+    echo "[!] Listener Tor tidak ditemukan."
+    systemctl status tor@default --no-pager -l
+    exit 1
+}
+
+# ------------------------------------------------------------
+# 9. Create nftables configuration
+# ------------------------------------------------------------
+
+echo
+echo "[8/10] Creating nftables configuration..."
+
+mkdir -p /etc/nftables.d
+
+NFT_FILE="/etc/nftables.d/tor-transparent.nft"
+
+cat > "$NFT_FILE" <<EOF
+table ip tor_transparent {
+    chain output {
+        type nat hook output priority -90; policy accept;
+
+        # Tor daemon sendiri jangan di-redirect
+        meta skuid $TOR_UID return
+
+        # Localhost
+        ip daddr 127.0.0.0/8 return
+
+        # Private / LAN networks
+        ip daddr 10.0.0.0/8 return
+        ip daddr 172.16.0.0/12 return
+        ip daddr 192.168.0.0/16 return
+
+        # TCP -> Tor TransPort
+        tcp dport != 9040 counter redirect to :9040
+
+        # DNS -> Tor DNSPort
+        udp dport 53 counter redirect to :5354
+        tcp dport 53 counter redirect to :5354
+    }
+}
+EOF
+
+# ------------------------------------------------------------
+# 10. Install nftables include
+# ------------------------------------------------------------
+
+NFT_MAIN="/etc/nftables.conf"
+
+if [[ -f "$NFT_MAIN" ]]; then
+    cp -a "$NFT_MAIN" \
+        "${NFT_MAIN}.backup.$(date +%Y%m%d-%H%M%S)"
+fi
+
+# Hapus include lama milik installer ini jika ada
+if [[ -f "$NFT_MAIN" ]]; then
+    sed -i '\|/etc/nftables.d/tor-transparent.nft|d' "$NFT_MAIN"
+fi
+
+cat >> "$NFT_MAIN" <<EOF
+
+# Tor transparent proxy
+include "/etc/nftables.d/tor-transparent.nft"
+EOF
+
+echo "[+] nftables config created."
+
+# ------------------------------------------------------------
+# Validate nftables
+# ------------------------------------------------------------
+
+echo
+echo "[9/10] Validating nftables..."
+
+nft -c -f "$NFT_MAIN"
+
+echo "[+] nftables configuration valid."
+
+# ------------------------------------------------------------
+# Load nftables
+# ------------------------------------------------------------
+
+systemctl enable nftables
+
+# Remove previous installer table if present.
+# Ignore failure when table doesn't exist.
+nft delete table ip tor_transparent 2>/dev/null || true
+
+nft -f "$NFT_FILE"
+
+echo "[+] Tor nftables rules loaded."
+
+# ------------------------------------------------------------
+# Final verification
+# ------------------------------------------------------------
+
+echo
+echo "[10/10] Final verification..."
+
+echo
+echo "========== TOR STATUS =========="
+systemctl status tor@default --no-pager -l | tail -n 20
+
+echo
+echo "========== LISTENERS =========="
+ss -lntup | grep -E '9040|9050|5354' || true
+
+echo
+echo "========== NFTABLES =========="
+nft list table ip tor_transparent
+
+echo
+echo "========== TOR SOCKS TEST =========="
+
+TOR_IP="$(curl -4 -s \
+    --connect-timeout 15 \
+    --max-time 30 \
+    --socks5-hostname 127.0.0.1:9050 \
+    https://api.ipify.org || true)"
+
+if [[ -n "$TOR_IP" ]]; then
+    echo "[+] Tor SOCKS IP: $TOR_IP"
+else
+    echo "[!] SOCKS test gagal."
+fi
+
+echo
+echo "=========================================="
+echo " INSTALLATION COMPLETE"
+echo "=========================================="
+echo
+echo "SOCKS5:"
+echo "  127.0.0.1:9050"
+echo
+echo "Transparent TCP:"
+echo "  127.0.0.1:9040"
+echo
+echo "Tor DNS:"
+echo "  127.0.0.1:5354"
+echo
+echo "ControlSocket:"
+echo "  /run/tor/control"
+echo
+echo "Tor UID:"
+echo "  $TOR_UID"
+echo
+echo "User:"
+echo "  $REAL_USER"
+echo
+echo "IMPORTANT:"
+echo "  Logout/login diperlukan agar group debian-tor aktif."
+echo
+echo "Untuk Brave:"
+echo "  pkill -f '/opt/brave.com/brave/brave'"
+echo "  /opt/brave.com/brave/brave --disable-quic &"
+echo
+echo "Test transparent proxy:"
+echo "  curl -4 https://check.torproject.org/api/ip"
+echo "  curl -4 https://api.ipify.org"
+echo "  curl -4 https://icanhazip.com"
+echo
+echo "Ganti circuit:"
+echo "  COOKIE=\$(xxd -p -c 256 /run/tor/control.authcookie)"
+echo "  printf 'AUTHENTICATE %s\\r\\nSIGNAL NEWNYM\\r\\nQUIT\\r\\n' \"\$COOKIE\" | socat - UNIX-CONNECT:/run/tor/control"
+echo
+echo "=========================================="

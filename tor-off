@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NFT_FILE="/etc/nftables.d/tor-transparent.nft"
+NFT_MAIN="/etc/nftables.conf"
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Jalankan dengan sudo."
+    exit 1
+fi
+
+echo "[+] Removing active Tor transparent rules..."
+
+# HANYA hapus table milik installer ini.
+nft delete table ip tor_transparent 2>/dev/null || true
+
+echo "[+] Stopping Tor..."
+
+systemctl stop tor@default 2>/dev/null || true
+systemctl disable tor@default 2>/dev/null || true
+
+echo "[+] Removing nftables persistent include..."
+
+if [[ -f "$NFT_MAIN" ]]; then
+    sed -i '\|/etc/nftables.d/tor-transparent.nft|d' "$NFT_MAIN"
+fi
+
+# Jangan biarkan nftables mengaktifkan rule Tor lagi saat boot
+systemctl disable nftables 2>/dev/null || true
+
+echo "[+] Restarting network services..."
+
+systemctl restart NetworkManager 2>/dev/null || true
+systemctl restart systemd-resolved 2>/dev/null || true
+resolvectl flush-caches 2>/dev/null || true
+
+echo
+echo "================================"
+echo " TOR TRANSPARENT: OFF"
+echo "================================"
+echo
+echo "Tor package/configuration tetap terinstall."
+echo "SOCKS/Transparent proxy tidak aktif."
+echo "Koneksi kembali menggunakan network normal."
+echo
+
+echo "Tor:"
+systemctl is-active tor@default || true
+
+echo
+echo "Tor nftables table:"
+if nft list table ip tor_transparent >/dev/null 2>&1; then
+    echo "[!] Masih aktif!"
+else
+    echo "[+] Tidak aktif."
+fi
