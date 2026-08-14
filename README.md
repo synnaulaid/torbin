@@ -10,7 +10,7 @@ Currently, it only runs on Debian-based Linux distributions.
 ## Installation
 This automatically install torbin and set tor service to run in background.
 
-`curl -sL "https://raw.githubusercontent.com/synnaulaid/torbin/refs/heads/master/settor" | bash`
+`curl -sL "https://raw.githubusercontent.com/synnaulaid/torbin/refs/heads/master/settor" | sudo bash`
 
 
 ## Usage
